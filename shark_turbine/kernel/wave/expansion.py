@@ -1,12 +1,19 @@
 import itertools
 import torch.fx as fx
 from typing import Any, TypeAlias
+from functools import partial
 
-from .constraints import Constraint, HardwareConstraint, WorkgroupConstraint
+from .constraints import (
+    Constraint,
+    HardwareConstraint,
+    WorkgroupConstraint,
+    TilingConstraint,
+)
 from ..ops.wave_ops import *
-from .._support.indexing import IndexingContext
+from .._support.indexing import IndexingContext, IndexSequence
 from ...support.logging import get_logger
 from .._support.tracing import CapturedTrace
+from .._support.indexing import index_symbol
 
 logger = get_logger("turbine.wave.expansion")
 # This represents a mapping of a node + indexing into the dimensions to the
@@ -45,7 +52,8 @@ def filter_and_zero_unselected_dims(
 
 
 def get_dim_combinations(
-    all_dims: dict[IndexSymbol, int], selection: Sequence[IndexSymbol]
+    all_dims: dict[IndexSymbol, int],
+    selection: Sequence[IndexSymbol],
 ):
     """
     Returns all combinations of sizes for the selected dimensions.
@@ -82,6 +90,95 @@ def is_expandable(arg: Any) -> bool:
     return isinstance(arg, CustomOp)
 
 
+def get_mma_dimensional_mapping(trace: CapturedTrace) -> dict[IndexSymbol, int]:
+    """
+    Given a trace, determine the MMA dimensional mapping for all the
+    MMA operations in the graph. For example, if we have
+        acc = tkw.mma(a_reg, b_reg, acc)
+    where a_reg has shape UxV, b has shape SxV and acc has shape UxS,
+    we map U to the MMA M dimension (0), S to the MMA N dimension (1) and
+    V to the MMA K dimension (2).
+    """
+
+    def is_mma(node: fx.Node) -> bool:
+        custom = get_custom(node)
+        return isinstance(custom, MMA)
+
+    mma_nodes = trace.walk(is_mma)
+    mapping: dict[IndexSymbol, int] = {}
+    for node in mma_nodes:
+        custom: MMA = get_custom(node)
+        m, n = custom.acc_type.symbolic_shape[-2:]
+        mapping[m] = 0
+        mapping[n] = 1
+        k = [
+            dim
+            for dim in custom.lhs_type.symbolic_shape
+            if dim in custom.rhs_type.symbolic_shape
+            and not dim in custom.acc_type.symbolic_shape
+        ][0]
+        mapping[k] = 2
+
+    return mapping
+
+
+def set_node_index(
+    constraints: Sequence[Constraint],
+    mma_index: dict[IndexSymbol, int],
+    dim_tile_size: dict[IndexSymbol, int],
+    custom: CustomOp,
+    dim_scaling: dict[IndexSymbol, int],
+):
+    """
+    Set the index of the node based on the user constraints. In certain
+    operators (like read, write), there is only a single index associated
+    with the node (the index to read from, the index to write to). But for
+    other operators like mma, each operand reads from a different index.
+
+    Rather than maintain operand specific indices for operators, we maintain
+    dimension specific indices for each operator. So for an mma operator that
+    has a signature of (MxK, NxK) -> MxN, we maintain only 3 mappings for
+    dimensions M, N and K, but allow each mapping to be piecewise conditioned
+    on the operand.
+    """
+    hardware_constraint = [c for c in constraints if isinstance(c, HardwareConstraint)]
+    other_constraints = [
+        c for c in constraints if not isinstance(c, HardwareConstraint)
+    ]
+    # Apply hardware constraint first since it dictates the stride and size.
+    sorted_constraints = hardware_constraint + other_constraints
+
+    for dim in custom.indexing_dims:
+        index_seq = None
+        for constraint in sorted_constraints:
+            mma_check = (
+                isinstance(constraint, HardwareConstraint)
+                and dim in mma_index
+                and isinstance(custom, MMA)
+            )
+
+            constraint_check = (
+                not isinstance(constraint, HardwareConstraint) and dim == constraint.dim
+            )
+
+            if (not mma_check) and (not constraint_check):
+                continue
+
+            if isinstance(constraint, HardwareConstraint):
+                index_seq = constraint.apply(mma_index[dim])
+            else:
+                if index_seq is None:
+                    index_seq = constraint.apply()
+                else:
+                    index_seq.start += constraint.apply().start
+
+        if index_seq is not None:
+            index_seq.start += dim_scaling[dim] * dim_tile_size[dim]
+            custom.index = {dim: index_seq}
+
+    setattr(custom.fx_node, "index", custom.index)
+
+
 def expand_graph(
     trace: CapturedTrace,
     constraints_or_scaling: Sequence[Constraint] | dict[IndexSymbol, int],
@@ -92,17 +189,34 @@ def expand_graph(
     """
     if isinstance(constraints_or_scaling, dict):
         dim_scaling = constraints_or_scaling
+        node_index_setter = lambda *args: None
     else:
-        dim_scaling = get_dim_scaling(constraints_or_scaling)
+        mma_index = get_mma_dimensional_mapping(trace)
+        dim_scaling, dim_tile_size = get_dim_scaling(constraints_or_scaling, mma_index)
+        node_index_setter = partial(
+            set_node_index, constraints_or_scaling, mma_index, dim_tile_size
+        )
 
     # Start from the back and expand in the corresponding indexing dimensions of a node
     # Then proceed to the operands
     leaf_nodes: list[Type[CustomOp]] = [Write]
 
+    # Some graphs may not have a write node, so we need to add the leaf nodes present in the
+    # graph, excluding output nodes.
+    all_fx_nodes_reversed = list(reversed(trace.get_root_graph().nodes))
+    has_write = any(
+        isinstance(get_custom(fx_node), Write) for fx_node in all_fx_nodes_reversed
+    )
+    if not has_write:
+        for node in (get_custom(fx_node) for fx_node in all_fx_nodes_reversed):
+            if isinstance(node, Output):
+                continue
+            leaf_nodes.append(node.__class__)
+            break
+
     expansion_context: ExpandedNodeMap = {}
-    for node in (
-        get_custom(fx_node) for fx_node in reversed(list(trace.get_root_graph().nodes))
-    ):
+    for node in (get_custom(fx_node) for fx_node in all_fx_nodes_reversed):
+
         # Expansion begins at the leaf nodes
         if node.__class__ not in leaf_nodes:
             continue
@@ -112,7 +226,14 @@ def expand_graph(
                 dim: val for dim, val in zip(dim_scaling.keys(), dim_combination)
             }
             logger.debug(f"Starting expansion at leaf:{node} in dims:{expand_dims}")
-            _expand_node(node, trace, expand_dims, dim_scaling, expansion_context)
+            _expand_node(
+                node,
+                trace,
+                expand_dims,
+                dim_scaling,
+                node_index_setter,
+                expansion_context,
+            )
 
 
 def _expand_node(
@@ -120,6 +241,7 @@ def _expand_node(
     trace: CapturedTrace,
     dim_query: dict[IndexSymbol, int],
     dim_scaling: dict[IndexSymbol, int],
+    node_index_setter: Callable[[CustomOp, dict[IndexSymbol, int]], None],
     context: ExpandedNodeMap,
 ) -> CustomOp:
     """Expand a single node in specific dimensions and recursively proceed to its inputs."""
@@ -128,7 +250,9 @@ def _expand_node(
         logger.debug(f"Already expanded node: {node} in {dim_query}")
         return context[(node, get_indexed_dims(dim_query, node))]
     elif isinstance(node, Reduction):
-        return _expand_reduction(node, trace, dim_query, dim_scaling, context)
+        return _expand_reduction(
+            node, trace, dim_query, dim_scaling, node_index_setter, context
+        )
     elif isinstance(node, GetResult):
         # The presence of a GetResult node indicates that the reduction has already
         # been expanded. Simply return the corresponding node.
@@ -149,11 +273,14 @@ def _expand_node(
 
     new_node.fx_node.expanded_dims = restricted_dims
     new_node.fx_node.name = get_expanded_name(node, restricted_dims)
+    node_index_setter(new_node, restricted_dims)
 
     # Proceed with expansion of the arguments
     for i, arg in enumerate(node.node_args):
         if is_expandable(arg):
-            new_arg = _expand_node(arg, trace, restricted_dims, dim_scaling, context)
+            new_arg = _expand_node(
+                arg, trace, restricted_dims, dim_scaling, node_index_setter, context
+            )
             new_node.update_arg(i, new_arg)
 
     context[(node, get_indexed_dims(restricted_dims, node))] = new_node
@@ -165,6 +292,7 @@ def _expand_reduction(
     trace: CapturedTrace,
     dim_query: dict[IndexSymbol, int],
     dim_scaling: dict[IndexSymbol, int],
+    node_index_setter: Callable[[CustomOp, dict[IndexSymbol, int]], None],
     context: ExpandedNodeMap,
 ) -> CustomOp:
     """Expand a reduction in a specific dimension and recursively proceed to its inputs."""
@@ -187,7 +315,7 @@ def _expand_reduction(
 
     new_output_args = []
     new_init_args = []
-    for dim_idx, dim_vals in enumerate(get_dim_combinations(dim_scaling, expand_dims)):
+    for dim_vals in get_dim_combinations(dim_scaling, expand_dims):
         for arg_idx, arg in enumerate(output.node_args):
             dims = {dim: val for dim, val in zip(dim_scaling.keys(), dim_vals)}
             # Add GetResult nodes for the corresponding dimensions
@@ -198,7 +326,9 @@ def _expand_reduction(
             context[(reduction, get_indexed_dims(dims, expand_dims))] = new_node
 
             # Proceed with expansion inside the reduction
-            new_output_args.append(_expand_node(arg, trace, dims, dim_scaling, context))
+            new_output_args.append(
+                _expand_node(arg, trace, dims, dim_scaling, node_index_setter, context)
+            )
 
             # Proceed with expansion outside the reduction
             for init_arg in reduction.init_args:
@@ -208,6 +338,7 @@ def _expand_reduction(
                         trace,
                         dims,
                         dim_scaling,
+                        node_index_setter,
                         context,
                     )
                 )
@@ -217,7 +348,9 @@ def _expand_reduction(
         "init_args", [new_init_arg.fx_node for new_init_arg in new_init_args]
     )
     output.update_arg("return_vals", [node.fx_node for node in new_output_args])
-    _handle_reduction_dim(reduction, output, trace, dim_scaling, context)
+    _handle_reduction_dim(
+        reduction, output, trace, dim_scaling, node_index_setter, context
+    )
     # Even though we expanded the reduction in multiple dimensions, we only return
     # the node corresponding to the original query
     return context[(reduction, get_indexed_dims(dim_query, expand_dims))]
@@ -236,9 +369,13 @@ def get_expanded_name(node: CustomOp, dims: dict[IndexSymbol, int]) -> str:
     return node_name
 
 
-def get_dim_scaling(constraints: Sequence[Constraint]) -> dict[IndexSymbol, int]:
+def get_dim_scaling(
+    constraints: Sequence[Constraint], mma_indices: dict[IndexSymbol, int]
+) -> tuple[dict[IndexSymbol, int]]:
     """Get the number of expansions for the dimensions based on the constraints."""
     dim_scaling: dict[IndexSymbol, int] = {}
+    dim_tile_size: dict[IndexSymbol, int] = {}
+    tile_size_mapping: dict[IndexSymbol, int] = {}
     hardware_constraints: list[HardwareConstraint] = [
         constraint
         for constraint in constraints
@@ -249,24 +386,44 @@ def get_dim_scaling(constraints: Sequence[Constraint]) -> dict[IndexSymbol, int]
 
     idxc = IndexingContext.current()
     for constraint in constraints:
-        if isinstance(constraint, WorkgroupConstraint):
+        if isinstance(constraint, WorkgroupConstraint) or isinstance(
+            constraint, TilingConstraint
+        ):
+            hw_cons = hardware_constraints[0]
             tile_size = idxc.get_static_value(constraint.tile_size)
-            wave_count = hardware_constraints[0].waves_per_block[
-                constraint.workgroup_dim
-            ]
-            mma_size = hardware_constraints[0].mma_matrix_shapes[
-                constraint.workgroup_dim
-            ]
-            if tile_size is None or wave_count is None or mma_size is None:
+            if not (
+                constraint.dim in mma_indices or constraint.dim in hw_cons.vector_shapes
+            ):
                 raise ValueError(
-                    "Tile size, wave count and mma size must be statically known"
+                    f"Attempting to determine vector shape for unmapped dimension {constraint.dim}"
                 )
-            if tile_size % wave_count != 0 or (tile_size / wave_count) % mma_size != 0:
+
+            if mma_indices:
+                vector_size = hardware_constraints[0].mma_matrix_shapes[
+                    mma_indices[constraint.dim]
+                ]
+            else:
+                vector_size = hardware_constraints[0].vector_shapes[constraint.dim]
+
+            wave_count = 1
+            if isinstance(constraint, WorkgroupConstraint):
+                wave_count = hardware_constraints[0].waves_per_block[
+                    constraint.workgroup_dim
+                ]
+            if tile_size is None or wave_count is None or vector_size is None:
                 raise ValueError(
-                    "Tile size must be divisible by wave count and mma size"
+                    "Tile size, wave count and vector size must be statically known"
                 )
-            dim_scaling[constraint.dim] = tile_size // wave_count // mma_size
-    return dim_scaling
+            if (
+                tile_size % wave_count != 0
+                or (tile_size / wave_count) % vector_size != 0
+            ):
+                raise ValueError(
+                    "Tile size must be divisible by wave count and vector size"
+                )
+            dim_scaling[constraint.dim] = tile_size // wave_count // vector_size
+            dim_tile_size[constraint.dim] = vector_size
+    return (dim_scaling, dim_tile_size)
 
 
 def _handle_reduction_dim(
@@ -274,6 +431,7 @@ def _handle_reduction_dim(
     output: Output,
     trace: CapturedTrace,
     dim_scaling: dict[IndexSymbol, int],
+    node_index_setter: Callable[[CustomOp, dict[IndexSymbol, int]], None],
     context: ExpandedNodeMap,
 ):
     # Rediscover iter args
@@ -309,7 +467,9 @@ def _handle_reduction_dim(
 
                 saved_arg = user.node_args[index]
                 user.update_arg(index, dummy)
-                new_node = _expand_node(user, trace, dims, dim_scaling, context)
+                new_node = _expand_node(
+                    user, trace, dims, dim_scaling, node_index_setter, context
+                )
 
                 # This expansion always happens, user should never be reused
                 assert new_node != user

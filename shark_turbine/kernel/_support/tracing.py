@@ -30,6 +30,7 @@ from ..lang.grid import Grid
 from ..lang.types import (
     Index,
 )
+from ..lang.wave_types import IndexMapping
 from ..ops.wave_ops import CustomOp, Placeholder, Reduction, Unknown
 
 from .regions import RegionGraph, SubgraphTracer
@@ -111,6 +112,8 @@ class KernelTracer(SubgraphTracer):
         # Let DataType persist as arguments.
         if isinstance(a, DataType):
             return a
+        if isinstance(a, IndexMapping):
+            return a
         return super().create_arg(a)
 
 
@@ -124,6 +127,14 @@ class CapturedTrace:
 
     def get_root_graph(self) -> fx.Graph:
         return self.get_subgraph(self.root_graph)
+
+    def walk(self, filter: Callable[[fx.Node], bool]) -> list[fx.Node]:
+        nodes: list[fx.Node] = []
+        for region in self.region_graph.subgraphs.values():
+            for node in region.nodes:
+                if filter(node):
+                    nodes.append(node)
+        return nodes
 
 
 ###############################################################################

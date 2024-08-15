@@ -1,7 +1,9 @@
 from __future__ import annotations
 from abc import ABC
 from dataclasses import dataclass, field, fields
+import operator
 import sys
+import copy
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -17,10 +19,11 @@ import torch.fx as fx
 
 if TYPE_CHECKING:
     from ..lang.wave_types import Memory, Register
-from .._support.indexing import IndexExpr, IndexSymbol
+from .._support.indexing import IndexExpr, IndexSymbol, IndexSequence
 from .._support.dtype import DataType
 from .._support.regions import RegionGraph
 from .base import OpDispatcher
+from ..lang.global_symbols import MMA_ACC, MMA_LHS, MMA_RHS
 
 T = TypeVar("T", bound=Type[Any])
 AccT = TypeVar("AccT")
@@ -39,7 +42,9 @@ def allocate(
 
 
 def read(
-    memory: "Memory", elements_per_thread: Optional[IndexExpr] = None
+    memory: "Memory",
+    elements_per_thread: Optional[IndexExpr | int] = None,
+    mapping: Optional[IndexMapping] = None,
 ) -> "Register":
     ...
 
@@ -62,6 +67,7 @@ def write(
     register_: "Register",
     memory: "Memory",
     elements_per_thread: Optional[IndexExpr | int] = None,
+    mapping: Optional[IndexMapping] = None,
 ):
     ...
 
@@ -86,6 +92,57 @@ def define_op(op_name: str) -> Callable[[T], T]:
         setattr(current_module, op_name, new_function)
         cls._tracing_function = new_function
 
+        return cls
+
+    return decorator
+
+
+def define_py_op(py_op: Callable) -> Callable[[T], T]:
+    """
+    Register python internal operators as custom ops.
+    This overloads python operator specific functions such as __add__ of
+    fx.Proxy with a handler in order to control the tracing of the operator and
+    map it to a dynamically created sublclass of UnaryPyOp or BinaryPyOp.
+    """
+    op_name = py_op.__name__
+
+    def decorator(cls: T) -> T:
+        # define new subclass of cls to represent this op
+        @dataclass
+        class NewSubclass(cls):
+            pass
+
+        NewSubclass.tkw_op_name = op_name
+        NewSubclass.__name__ = f"{op_name.capitalize()}"
+        NewSubclass.__module__ = cls.__module__
+        current_module = sys.modules[cls.__module__]
+        setattr(current_module, NewSubclass.__name__, NewSubclass)
+
+        original_handler = None
+        if hasattr(fx.Proxy, f"__{op_name}__"):
+            original_handler = getattr(fx.Proxy, f"__{op_name}__")
+
+        def new_function(*args: Any, **kwargs: dict[str, Any]):
+            dispatcher = None
+            try:
+                dispatcher = OpDispatcher.current()
+            except IndexError:
+                handler = original_handler
+
+            if dispatcher:
+                try:
+                    handler = getattr(dispatcher, f"handle_{op_name}")
+                except AttributeError:
+                    handler = original_handler
+
+            return handler(*args, **kwargs)
+
+        if original_handler:
+            new_function.__name__ = op_name
+            NewSubclass._tracing_function = new_function
+            setattr(fx.Proxy, f"__{op_name}__", new_function)
+
+        # Return cls unchanged so we can reuse the decorator to register more ops
         return cls
 
     return decorator
@@ -119,13 +176,14 @@ class CustomOp(ABC):
     fx_node: Optional[fx.Node] = field(default=None, init=False)
     tkw_op_name: str = field(default="unknown", init=False)
     _tracing_function: Optional[Callable[..., Any]] = field(default=None, init=False)
-    index: Optional[IndexExpr] = field(default=None, init=False)
 
     @classmethod
     def from_fx_node(cls: Type[CustomOpT], node: fx.Node) -> CustomOpT:
         instance = cls(*node.args)
         instance.fx_node = node
         instance.graph = node.graph
+        if hasattr(node, "index"):
+            instance.index = node.index
         return instance
 
     def __post_init__(self):
@@ -146,7 +204,14 @@ class CustomOp(ABC):
 
     def custom_string(self, value_map: dict[str, str]) -> str:
         # print all variables of the node apart from graph and fx_node
-        vars_list = [f"{key}={value}" for key, value in vars(self).items()][:-2]
+        ignore_list = ["fx_node", "graph"]
+        vars_list = [
+            f"{key}={value}"
+            for key, value in vars(self).items()
+            if key not in ignore_list and value is not None
+        ]
+        if hasattr(self.fx_node, "index") and self.fx_node.index:
+            vars_list.append(f"index={self.fx_node.index}")
         vars_str = ", ".join(vars_list)
         return f"{self.tkw_op_name}({vars_str})"
 
@@ -161,6 +226,7 @@ class CustomOp(ABC):
         )
         self.fx_node.tkw_op = self.__class__
         self.fx_node.tkw_op_name = self.tkw_op_name
+        self.fx_node.index = None
         return self.fx_node
 
     def _add_proxy_to_graph(self, region_graph: RegionGraph):
@@ -207,6 +273,7 @@ class CustomOp(ABC):
             graph.inserting_after(self.fx_node)
         new_node = graph.node_copy(self.fx_node)
         new_node.tkw_op = self
+        new_node.index = copy.deepcopy(self.fx_node.index)
         if new_name:
             new_node.name = new_name
         return get_custom(new_node)
@@ -253,6 +320,76 @@ class CustomOp(ABC):
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
         return []
+
+    @property
+    def index(self) -> Optional[dict[IndexSymbol, IndexSequence]]:
+        if hasattr(self.fx_node, "index"):
+            return self.fx_node.index
+        return None
+
+    @index.setter
+    def index(self, value: Any):
+        """
+        Updates the index of the node based on a per-dimension index sequence.
+        """
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for dim, key in value.items():
+                assert isinstance(
+                    key, IndexSequence
+                ), f"Expected IndexSequence, got {key}"
+                if not hasattr(self.fx_node, "index"):
+                    self.fx_node.index = {}
+                self.fx_node.index[dim] = key
+        else:
+            raise ValueError("Index must be a dict")
+
+
+@define_py_op(operator.getitem)
+@define_py_op(operator.add)
+@define_py_op(operator.sub)
+@dataclass
+class BinaryPyOp(CustomOp, ABC):
+    """
+    Represents a binary python operator.
+    """
+
+    lhs: Any
+    rhs: Any
+
+    @property
+    def indexing_dims(self) -> list[IndexSymbol]:
+        combined_dims = []
+        if isinstance(self.lhs, fx.Node):
+            combined_dims += get_custom(self.lhs).indexing_dims
+        if isinstance(self.rhs, fx.Node):
+            combined_dims += get_custom(self.rhs).indexing_dims
+
+        unique_dims = list(dict.fromkeys(combined_dims))
+        return unique_dims
+
+    @property
+    def py_operator(self) -> str:
+        return self.tkw_op_name
+
+
+@define_py_op(operator.neg)
+@dataclass
+class UnaryPyOp(CustomOp, ABC):
+    """
+    Represents a unary python operator.
+    """
+
+    arg: fx.Node
+
+    @property
+    def indexing_dims(self) -> list[IndexSymbol]:
+        return get_custom(self.arg).indexing_dims
+
+    @property
+    def py_operator(self) -> str:
+        return self.tkw_op_name
 
 
 @final
@@ -402,15 +539,64 @@ class MMA(CustomOp):
         unique_dims = list(dict.fromkeys(combined_dims))
         return unique_dims
 
+    @property
+    def lhs_type(self) -> Memory:
+        return get_custom(self.lhs).type
+
+    @property
+    def rhs_type(self) -> Memory:
+        return get_custom(self.rhs).type
+
+    @property
+    def acc_type(self) -> Memory:
+        return get_custom(self.acc).type
+
+    def operand_index(
+        self, operand_map: dict[IndexSymbol, int], shape: list[IndexExpr]
+    ) -> list[IndexSequence]:
+        indices: list[IndexSequence] = []
+        for dim in shape:
+            indices.append(self.index[dim].subs(operand_map))
+        return indices
+
+    @property
+    def lhs_index(self) -> list[IndexSequence]:
+        operand_map = {MMA_LHS: 1, MMA_RHS: 0, MMA_ACC: 0}
+        return self.operand_index(operand_map, self.lhs_type.symbolic_shape)
+
+    @property
+    def rhs_index(self) -> list[IndexSequence]:
+        operand_map = {MMA_LHS: 0, MMA_RHS: 1, MMA_ACC: 0}
+        return self.operand_index(operand_map, self.rhs_type.symbolic_shape)
+
+    @property
+    def acc_index(self) -> list[IndexSequence]:
+        operand_map = {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1}
+        if self.acc.type is None:
+            return None
+        return self.operand_index(operand_map, self.acc_type.symbolic_shape)
+
+    def custom_string(self, value_map: dict[str, str]) -> str:
+        if self.index is None:
+            return super().custom_string(value_map)
+        custom_str = f"{self.tkw_op_name}("
+        custom_str += f"lhs={self.lhs} (index = {self.lhs_index}), "
+        custom_str += f"rhs={self.rhs} (index = {self.rhs_index}), "
+        custom_str += f"acc={self.acc} (index = {self.acc_index}))"
+        return custom_str
+
 
 @define_op("read")
 @dataclass
 class Read(CustomOp):
     memory: fx.Proxy
     elements_per_thread: Optional[Any] = None
+    mapping: Optional[IndexMapping] = None
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
+        if self.mapping is not None:
+            return list(self.mapping.output_shape)
         # TODO: This could contain ints.
         return list(self.memory.type.symbolic_shape)
 
@@ -470,6 +656,7 @@ class Write(CustomOp):
     register_: fx.Proxy
     memory: fx.Proxy
     elements_per_thread: Optional[Any]
+    mapping: Optional[IndexMapping] = None
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
