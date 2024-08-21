@@ -21,6 +21,7 @@ jobs:
       matrix:
         version: [3.11]
 
+    container: ghcr.io/nod-ai/manylinux_ghr_x86_64:main
     runs-on:
       - arc-test-runners
     steps:
