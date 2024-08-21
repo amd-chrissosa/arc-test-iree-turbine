@@ -14,6 +14,7 @@ from .._support.indexing import IndexingContext, IndexSequence
 from ...support.logging import get_logger
 from .._support.tracing import CapturedTrace
 from .._support.indexing import index_symbol
+from ..lang.global_symbols import *
 
 logger = get_logger("turbine.wave.expansion")
 # This represents a mapping of a node + indexing into the dimensions to the
@@ -74,7 +75,7 @@ def get_indexed_dims(
     """
     if isinstance(nodeOrDims, CustomOp):
         nodeOrDims = nodeOrDims.indexing_dims
-    return tuple((key, all_dims[key]) for key in nodeOrDims)
+    return tuple((key, all_dims[key]) for key in nodeOrDims if key in all_dims)
 
 
 def get_last(node_list: fx.graph._node_list) -> fx.Node:  # type: ignore
@@ -173,8 +174,11 @@ def set_node_index(
                     index_seq.start += constraint.apply().start
 
         if index_seq is not None:
-            index_seq.start += dim_scaling[dim] * dim_tile_size[dim]
+            if dim in dim_scaling and dim in dim_tile_size:
+                index_seq.start += dim_scaling[dim] * dim_tile_size[dim]
             custom.index = {dim: index_seq}
+        else:
+            custom.index = {dim: IndexSequence(0, 1, 1)}
 
     setattr(custom.fx_node, "index", custom.index)
 
@@ -258,6 +262,9 @@ def _expand_node(
         # been expanded. Simply return the corresponding node.
         reduction = get_custom(node.value)
         return context[(reduction, get_indexed_dims(dim_query, reduction))]
+    elif isinstance(node, Allocate):
+        # Allocate nodes are not expanded.
+        return node
 
     # Filter out the dimensions that are not indexed by the node
     restricted_dims = filter_and_zero_unselected_dims(dim_query, node.indexing_dims)
@@ -361,6 +368,9 @@ def get_expanded_name(node: CustomOp, dims: dict[IndexSymbol, int]) -> str:
 
     separated = node.fx_node.name.split("_")
     node_name = separated[0]
+    if isinstance(node, Read) or isinstance(node, Write):
+        if get_custom(node.memory).type.address_space == SHARED_ADDRESS_SPACE:
+            node_name = node_name + "_shared"
     # Special case for get_result op
     if node_name == "get":
         node_name = node_name + separated[1]
@@ -375,7 +385,6 @@ def get_dim_scaling(
     """Get the number of expansions for the dimensions based on the constraints."""
     dim_scaling: dict[IndexSymbol, int] = {}
     dim_tile_size: dict[IndexSymbol, int] = {}
-    tile_size_mapping: dict[IndexSymbol, int] = {}
     hardware_constraints: list[HardwareConstraint] = [
         constraint
         for constraint in constraints
@@ -442,7 +451,7 @@ def _handle_reduction_dim(
         if isinstance(node, IterArg):
             iter_args.append(node)
 
-    new_outputs = [iter_arg.fx_node for iter_arg in iter_args]
+    new_outputs = list(reduction.outputs(trace.get_subgraph(reduction.subgraph_name)))
     # Users of the loop carried nodes will be duplicated
     for idx, carried_node in enumerate(iter_args):
         # The initial nodes are expanded in the first dimension, so we start from 1
@@ -464,6 +473,7 @@ def _handle_reduction_dim(
                 # placeholder which will not trigger further expansion.
                 index = user.node_args.index(carried_node)
                 dummy = Placeholder("dummy").add_to_graph(user.graph)
+                dummy.type = None
 
                 saved_arg = user.node_args[index]
                 user.update_arg(index, dummy)

@@ -3,9 +3,12 @@ import sympy
 from typing import Any, Callable, ClassVar, Optional, List, Type
 from dataclasses import dataclass
 import torch.fx as fx
+import torch.utils._pytree as pytree
 
 from ..compiler.ir import (
+    Attribute,
     DenseElementsAttr,
+    FloatAttr,
     IndexType,
     InsertionPoint,
     IntegerAttr,
@@ -17,17 +20,32 @@ from ..compiler.ir import (
     ShapedType,
     Value,
     VectorType,
+    amdgpu_d,
     arith_d,
     func_d,
     gpu_d,
+    memref_d,
     stream_d,
+    scf_d,
     vector_d,
 )
 from shark_turbine.aot.support.ir_utils import _is_float_type, _is_integer_like_type
 
 # TK infrastructure imports.
 from shark_turbine.kernel.lang.global_symbols import *
-from ..ops.wave_ops import write, register, mma, read, reduction, get_custom
+from ..ops.wave_ops import (
+    write,
+    register,
+    mma,
+    read,
+    reduction,
+    get_custom,
+    get_result,
+    allocate,
+    shared_memory_barrier,
+    CustomOp,
+)
+from ..lang.wave_types import IndexMapping, IndexSymbol
 from ..compiler.base import CodegenError, ValidationError, NDEBUG
 from ..compiler.kernel_codegen import BoundKernelSignature
 from .._support.tracing import CapturedTrace
@@ -39,6 +57,7 @@ from ..compiler.vector_codegen import (
     cast_py_value,
     cast_vector,
 )
+from .constraints import Constraint, HardwareConstraint, MMAType, TilingConstraint
 
 # Indexing imports.
 from .._support.indexing import IndexingContext, IndexExpr, IndexSequence
@@ -50,6 +69,7 @@ class WaveEmitter:
 
     root_sig: BoundKernelSignature
     trace: CapturedTrace
+    constraints: list[Constraint]
     ip: InsertionPoint = None
     OP_HANDLERS: ClassVar[dict[str, Callable[["WaveEmitter", fx.Node], None]]] = {}
     _node_values: ClassVar[dict[fx.Node, List[IRProxyValue]]] = {}
@@ -68,6 +88,7 @@ class WaveEmitter:
             gpu_d.thread_id(gpu_d.Dimension.y),
             gpu_d.thread_id(gpu_d.Dimension.z),
         ]
+        self.induction_vars: dict[IndexSymbol, Value] = {}
 
     def emit(self, graph: Optional[fx.Graph] = None):
         with self.ip, Location.unknown():
@@ -85,6 +106,8 @@ class WaveEmitter:
         for node in graph.nodes:
             if node.op == "call_function" or node.op == "call_method":
                 self._emit_function_call_node(node)
+            if node.op == "output":
+                return node.args
 
     def _emit_function_call_node(self, node: fx.Node):
         target_op = node.tkw_op_name
@@ -101,12 +124,20 @@ class WaveEmitter:
         if values is None:
             values = [self.root_sig.resolve_by_reference(("node", node))]
             self._node_values[node] = values
+        values = [v.ir_value if isinstance(v, IRProxyValue) else v for v in values]
         return values
 
     def bind_node_proxy(self, node: fx.Node, proxy: IRProxyValue):
         """Binds a node's result to a Python/IR proxy object."""
         assert NDEBUG or (isinstance(node, fx.Node) and isinstance(proxy, IRProxyValue))
         self._node_values[node] = [proxy]
+
+    def bind_node_proxies(self, node: fx.Node, proxies: List[IRProxyValue]):
+        assert NDEBUG or (
+            isinstance(node, fx.Node)
+            and all(isinstance(p, IRProxyValue) for p in proxies)
+        )
+        self._node_values[node] = proxies
 
 
 def get_type_or_element_type(operand_type: IrType):
@@ -120,11 +151,22 @@ def get_type_or_element_type(operand_type: IrType):
 def gen_sympy_index(emitter: WaveEmitter, expr: sympy.Expr) -> OpResult:
     stack: list[OpResult] = []
 
+    induction_var_syms = []
+    induction_vars = []
+    for constraint in emitter.constraints:
+        if isinstance(constraint, TilingConstraint):
+            assert (
+                constraint.dim in emitter.induction_vars
+            ), f"Could not find induction var for {constraint.dim} dimension"
+            induction_var_syms.append(constraint.induction_var)
+            induction_vars.append(emitter.induction_vars[constraint.dim])
+
     # TODO: factor this out
-    all_symbols = emitter.thread_ids + emitter.workgroup_ids
+    all_symbols = emitter.thread_ids + emitter.workgroup_ids + induction_vars
     dynamics = dict(
         zip(
-            [THREAD_0, THREAD_1, THREAD_2, WORKGROUP_0, WORKGROUP_1, WORKGROUP_2],
+            [THREAD_0, THREAD_1, THREAD_2, WORKGROUP_0, WORKGROUP_1, WORKGROUP_2]
+            + induction_var_syms,
             all_symbols,
         )
     )
@@ -202,6 +244,14 @@ def gen_sympy_index(emitter: WaveEmitter, expr: sympy.Expr) -> OpResult:
     return stack[0]
 
 
+def get_constant_attr(value: Any, element_type: IrType) -> Attribute:
+    if _is_integer_like_type(element_type):
+        return IntegerAttr.get(element_type, int(value))
+    if _is_float_type(element_type):
+        return FloatAttr.get(element_type, float(value))
+    raise CodegenError(f"Cannot create a constant attribute for type `{element_type}`")
+
+
 def handle_op(op: Callable[..., Any]):
     def decorator(
         f: Callable[[WaveEmitter, fx.Node], None]
@@ -219,7 +269,36 @@ def handle_op(op: Callable[..., Any]):
 
 @handle_op(register)
 def handle_register(emitter: WaveEmitter, node: fx.Node):
-    raise NotImplementedError("Register: Currently only stub implementation")
+    try:
+        shape, dtype, value = node.args
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+    if hasattr(node, "thread_shape"):
+        shape = [node.thread_shape]
+    vector_shape = cast_py_literal(emitter, shape)
+    element_type = IrType.parse(dtype.ir_type_asm())
+    vector_type = VectorType.get(vector_shape, element_type)
+    register = arith_d.ConstantOp(
+        vector_type,
+        DenseElementsAttr.get_splat(
+            vector_type, get_constant_attr(value, element_type)
+        ),
+    ).result
+    emitter.bind_node_proxy(node, IRProxyValue(register))
+
+
+@handle_op(allocate)
+def handle_allocate(emitter: WaveEmitter, node: fx.Node):
+    try:
+        shape, distributed_shape, dtype, address_space = node.args
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+    memref_shape = cast_py_literal(emitter, distributed_shape)
+    element_type = IrType.parse(dtype.ir_type_asm())
+    address_space = Attribute.parse("#gpu.address_space<workgroup>")
+    memref_type = MemRefType.get(memref_shape, element_type, None, address_space)
+    alloc = memref_d.alloc(memref_type, [], [])
+    emitter.bind_node_proxy(node, IRProxyValue(alloc))
 
 
 def _get_start_indices(
@@ -239,11 +318,90 @@ def _compute_offset(indices: list[int], strides: list[int]) -> int:
     return int(sum(i * s for i, s in zip(indices, strides)))
 
 
+def _get_symbolic_shape(node: fx.Node) -> tuple[IndexExpr]:
+    return get_custom(node).type.symbolic_shape
+
+
+def _is_identity_mapping(
+    mapping: IndexMapping,
+    input_shape: Optional[tuple[IndexExpr]] = None,
+    output_shape: Optional[tuple[IndexExpr]] = None,
+) -> bool:
+    if not mapping.is_identity():
+        return False
+
+    if input_shape is not None and mapping.input_shape != input_shape:
+        return False
+
+    if output_shape is not None and mapping.output_shape != output_shape:
+        return False
+
+    return True
+
+
+def _construct_gather_scatter_indices(
+    emitter: WaveEmitter,
+    symbolc_shape: tuple[IndexExpr],
+    index: tuple[IndexExpr],
+    mapping: IndexMapping,
+    elements_per_thread: int,
+    is_read: bool,
+) -> tuple[OpResult, OpResult, OpResult]:
+    # Apply symbolc_shape order to indices, e.g. if original mapping is
+    # {M: iter(0), N: iter(1)} and symbolc_shape is (N, M), result will
+    # be (iter(1), iter(0))
+    if is_read:
+        assert (
+            mapping.is_output_identity()
+        ), "non-identity output mapping is not supported yet"
+        index_mapping = mapping.map_input_indices(symbolc_shape)
+    else:
+        assert (
+            mapping.is_input_identity()
+        ), "non-identity input mapping is not supported yet"
+        index_mapping = mapping.map_output_indices(symbolc_shape)
+
+    iters = mapping.iters
+
+    # As we only support identity input/output mapping for now, we can directly
+    # substitute iterators with corresponding expanded index.
+    subs = [(sym, expr.start) for sym, expr in zip(iters.keys(), index.values())]
+
+    # Contruct input/output index, substituting iterators in input mapping with
+    # expanded index.
+    result_index = {key: m.subs(subs) for key, m in zip(symbolc_shape, index_mapping)}
+
+    strides = strides_from_symbolic_shape(IndexingContext.current(), symbolc_shape)
+    offsets = []
+    subs = [(sym, 0) for sym in iters.keys()]
+    for i in range(elements_per_thread):
+        # Update most-minor dim, i.e. in case of identity mapping it will
+        # be equivalent to just vector.load
+        subs[-1] = (subs[-1][0], i)
+        indices = [int(i.subs(subs)) for i in index_mapping]
+        offsets.append(
+            IntegerAttr.get(IndexType.get(), _compute_offset(indices, strides))
+        )
+
+    start_indices = _get_start_indices(emitter, result_index)
+    offsets_vec_type = VectorType.get([elements_per_thread], IndexType.get())
+
+    offsets_vec = arith_d.ConstantOp(
+        offsets_vec_type, DenseElementsAttr.get(offsets, offsets_vec_type)
+    )
+
+    mask_vec_type = VectorType.get([elements_per_thread], IntegerType.get_signless(1))
+
+    mask = vector_d.constant_mask(mask_vec_type, [elements_per_thread])
+
+    return start_indices, offsets_vec, mask
+
+
 @handle_op(read)
 def handle_read(emitter: WaveEmitter, node: fx.Node):
     # This is similar to tkl.store with fixed start indices for now.
     try:
-        memory, elements_per_thread, mapping = node.args
+        memory, elements_per_thread, mapping, _ = node.args
     except ValueError as e:
         raise ValidationError("Malformed arguments") from e
 
@@ -258,55 +416,22 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
 
     element_type = kb_ir_type.element_type
     vector_type = VectorType.get(vector_shape, element_type)
-    if mapping is None:
+    input_shape = _get_symbolic_shape(memory)
+    if mapping is None or _is_identity_mapping(mapping, input_shape=input_shape):
         start_indices = _get_start_indices(emitter, index)
         result = vector_d.load(vector_type, kb_src, start_indices)
     else:
-        assert (
-            mapping.is_output_identity()
-        ), "non-identity output mapping is not supported yet"
-
-        # We need original symbolic shape to determine dimensions access order.
-        mem_shape = get_custom(memory).type.symbolic_shape
-
-        # Apply input order to input indices, e.g. if original input_mapping was
-        # {M: iter(0), N: iter(1)} and source mem has shape (N, M), result will
-        # be (iter(1), iter(0))
-        input_mapping = mapping.map_input_indices(mem_shape)
-
-        iters = mapping.iters
-
-        # As we only support identity output mapping for now, we can directly
-        # substitute iterators with corresponding expanded index.
-        subs = [(sym, expr.start) for sym, expr in zip(iters.keys(), index.values())]
-
-        # Contruct input index, substituting iterators in input mapping with
-        # expended index.
-        input_index = {key: m.subs(subs) for key, m in zip(mem_shape, input_mapping)}
-
-        strides = strides_from_symbolic_shape(IndexingContext.current(), mem_shape)
-        offsets = []
-        subs = [(sym, 0) for sym in iters.keys()]
-        for i in range(elements_per_thread):
-            # Update most-minor dim, i.e. in case of identity mapping it will
-            # be quivalent to just vector.load
-            subs[-1] = (subs[-1][0], i)
-            indices = [int(i.subs(subs)) for i in input_mapping]
-            offsets.append(
-                IntegerAttr.get(IndexType.get(), _compute_offset(indices, strides))
-            )
-
-        start_indices = _get_start_indices(emitter, input_index)
-        offsets_vec_type = VectorType.get([elements_per_thread], IndexType.get())
-        mask_vec_type = VectorType.get(
-            [elements_per_thread], IntegerType.get_signless(1)
+        start_indices, offsets_vec, mask = _construct_gather_scatter_indices(
+            emitter=emitter,
+            symbolc_shape=input_shape,
+            index=index,
+            mapping=mapping,
+            elements_per_thread=elements_per_thread,
+            is_read=True,
         )
 
-        offsets_vec = arith_d.ConstantOp(
-            offsets_vec_type, DenseElementsAttr.get(offsets, offsets_vec_type)
-        )
-        mask = vector_d.constant_mask(mask_vec_type, [elements_per_thread])
-        zero = arith_d.ConstantOp(vector_type.element_type, 0)
+        zero = int(0) if _is_integer_like_type(element_type) else float(0)
+        zero = arith_d.ConstantOp(vector_type.element_type, zero)
         passthru = vector_d.splat(vector_type, zero)
 
         result = vector_d.gather(
@@ -323,26 +448,44 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
     except ValueError as e:
         raise ValidationError("Malformed arguments") from e
 
-    assert mapping is None, "mapping is not supported yet"
-
     # memory has no IR node yet.
     kb_dest, kb_ir_type, kb_py_type = cast_kernel_buffer(emitter, memory)
     insert_vector = cast_vector(emitter, register, element_type=kb_ir_type.element_type)
     insert_type = VectorType(insert_vector.type)
+    vector_shape = cast_py_literal(emitter, (elements_per_thread,))
 
     # TODO: Support elements_per_thread size mismatch and broadcasting
-    assert tuple(insert_type.shape) == (
-        elements_per_thread,
-    ), f"Shape doesn't match: {tuple(insert_type.shape)} and {(elements_per_thread,)}"
+
+    assert (
+        tuple(insert_type.shape) == vector_shape
+    ), f"Shape doesn't match: {tuple(insert_type.shape)} and {(vector_shape)}"
 
     if not hasattr(node, "index"):
         raise ValidationError("codegen expected read to have index attr.")
 
-    start_indices = []
-    for dim_indexing in node.index:
-        start_indices.append(gen_sympy_index(emitter, node.index[dim_indexing].start))
+    index = node.index
+    input_shape = _get_symbolic_shape(register)
+    output_shape = _get_symbolic_shape(memory)
+    if mapping is None or _is_identity_mapping(
+        mapping, input_shape=input_shape, output_shape=output_shape
+    ):
+        start_indices = _get_start_indices(emitter, index)
+        vector_d.store(insert_vector, kb_dest, start_indices)
+    else:
+        assert (
+            input_shape == mapping.input_shape
+        ), "non-identity input mapping is not supported yet"
 
-    vector_d.store(insert_vector, kb_dest, start_indices)
+        start_indices, offsets_vec, mask = _construct_gather_scatter_indices(
+            emitter=emitter,
+            symbolc_shape=output_shape,
+            index=index,
+            mapping=mapping,
+            elements_per_thread=elements_per_thread,
+            is_read=False,
+        )
+
+        vector_d.scatter(kb_dest, start_indices, offsets_vec, mask, insert_vector)
 
 
 ###############################################################################
@@ -350,9 +493,49 @@ def handle_write(emitter: WaveEmitter, node: fx.Node):
 ###############################################################################
 
 
+def emit_mfma(
+    m: int, n: int, k: int, vector_type: VectorType, acc: Value, values: list[Value]
+):
+    m = get_constant_attr(m, IntegerType.get_signless(32))
+    n = get_constant_attr(n, IntegerType.get_signless(32))
+    k = get_constant_attr(k, IntegerType.get_signless(32))
+    blocks = get_constant_attr(1, IntegerType.get_signless(32))
+
+    result = amdgpu_d.mfma(
+        dest_d=vector_type,
+        m=m,
+        n=n,
+        k=k,
+        blocks=blocks,
+        source_a=values[0],
+        source_b=values[1],
+        dest_c=acc,
+    )
+    return result
+
+
 @handle_op(mma)
 def handle_mma(emitter: WaveEmitter, node: fx.Node):
-    raise NotImplementedError("MMA: Currently only stub implementation")
+    try:
+        lhs, rhs, acc = node.args
+        acc = cast_vector(emitter, acc)
+        values = [cast_vector(emitter, val) for val in [lhs, rhs]]
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+
+    vector_type = VectorType(acc.type)
+
+    hardware_constraints = [
+        constraint
+        for constraint in emitter.constraints
+        if isinstance(constraint, HardwareConstraint)
+    ]
+    if not hardware_constraints:
+        raise CodegenError("No hardware constraints found.")
+
+    m, n, k = hardware_constraints[0].mma_matrix_shapes
+    result = emit_mfma(m, n, k, vector_type, acc, values)
+    emitter.bind_node_proxy(node, IRProxyValue(result))
 
 
 @handle_op(operator.add)
@@ -403,4 +586,84 @@ def handle_sub(emitter: WaveEmitter, node: fx.Node):
 
 @handle_op(reduction)
 def handle_reduction(emitter: WaveEmitter, node: fx.Node):
-    raise NotImplementedError("Reduction: Currently only stub implementation")
+    try:
+        axis, init_args, subgraph, implicit_capture = node.args
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+
+    # Flatten init_args and get IR values for each of them.
+    flat_init_args, _ = pytree.tree_flatten((init_args))
+    flat_init_args = [cast_py_value(emitter, arg) for arg in flat_init_args]
+
+    # Without scheduling, we assume that we always start at 0.
+    start = arith_d.constant(IndexType.get(), int(0))
+
+    idxc = IndexingContext.current()
+    # For now, we assume that dimensions that have tiling constraints on them,
+    # do not have any other constraints.
+    dim = axis.subs(idxc.subs)
+    end = arith_d.constant(IndexType.get(), int(dim))
+
+    step = None
+    for constraint in emitter.constraints:
+        if isinstance(constraint, TilingConstraint) and constraint.dim == axis:
+            tile_size = constraint.tile_size.subs(idxc.subs)
+            step = arith_d.constant(IndexType.get(), int(tile_size))
+
+    if not step:
+        raise CodegenError(
+            "Could not determine step size for reduction due to missing tiling constraint."
+        )
+
+    forOp = scf_d.ForOp(
+        start,
+        end,
+        step,
+        [a.ir_value for a in flat_init_args],
+    )
+    emitter.induction_vars[axis] = forOp.induction_variable
+    with InsertionPoint(forOp.body):
+        # Add mapping for iter args.
+        subgraph: fx.Graph = emitter.trace.get_subgraph(subgraph)
+        iter_args: list[fx.Node] = get_custom(node).iter_args(subgraph)
+        for i, v in enumerate(forOp.inner_iter_args):
+            emitter.bind_node_proxy(iter_args[i], IRProxyValue(v))
+        captured_vars: list[fx.Node] = get_custom(node).captured_vars(subgraph)
+        for root_v, subgraph_v in zip(implicit_capture, captured_vars):
+            emitter._node_values[subgraph_v] = emitter.lookup_node_values(root_v)
+        # Emit the subgraph.
+        return_values = emitter._emit_graph(subgraph)
+        # Flattern return values.
+        flat_ret_values, _ = pytree.tree_flatten((return_values))
+        flat_ret_values = [
+            cast_py_value(emitter, value).ir_value for value in flat_ret_values
+        ]
+        scf_d.YieldOp(flat_ret_values)
+
+    emitter.bind_node_proxies(node, [IRProxyValue(v) for v in forOp.results_])
+
+
+###############################################################################
+# Synchronization ops
+###############################################################################
+
+
+@handle_op(shared_memory_barrier)
+def handle_shared_memory_barrier(emitter: WaveEmitter, node: fx.Node):
+    amdgpu_d.lds_barrier()
+
+
+###############################################################################
+# Miscellanous ops
+###############################################################################
+
+
+@handle_op(get_result)
+def handle_get_result(emitter: WaveEmitter, node: fx.Node):
+    try:
+        value, res_idx = node.args
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+
+    for_op = emitter.lookup_node_values(value)[0].owner
+    emitter.bind_node_proxy(node, IRProxyValue(for_op.results[res_idx]))

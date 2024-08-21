@@ -2,7 +2,7 @@ from typing import Any, Callable, Optional
 import torch.fx as fx
 import inspect
 
-from ..compiler import builder, dispatch_codegen, kernel_codegen
+from ..compiler import builder, dispatch_codegen, kernel_codegen, host_codegen
 from ..compiler.ir import Context, Operation
 from .codegen import WaveEmitter
 from .constraints import (
@@ -17,10 +17,12 @@ from .codegen import WaveEmitter
 from .expansion import expand_graph
 from .promotion import promote_placeholders
 from .hoisting import hoist_allocs
+from .utils import canonicalize_module
 from ..lang import Grid, IndexMapping
 from ..lang.global_symbols import *
 from ..ops import wave_ops
 from ..ops.wave_ops import Reduction, CustomOp, get_custom
+from .register_analysis import determine_register_shape
 from .._support.indexing import IndexingContext, IndexExpr
 import shark_turbine.kernel.lang as tkl
 from .._support.tracing import (
@@ -29,6 +31,8 @@ from .._support.tracing import (
     KernelRegionGraph,
     Launchable,
 )
+from iree.compiler import compile_str
+import iree.runtime as rt
 
 __all__ = ["wave", "wave_trace_only"]
 
@@ -46,6 +50,28 @@ def wave_trace_only(constraints: Optional[list[Constraint]] = None):
         return wave._trace  # type: ignore
 
     return decorator
+
+
+def _invoke(vm_context, device, entry_function, inputs, outputs):
+    arg_list = rt.VmVariantList(len(inputs))
+    ret_list = rt.VmVariantList(len(outputs))
+
+    for input in inputs:
+        input_cpu = input.cpu().contiguous()
+        device_array = rt.asdevicearray(device, input_cpu)
+        arg_list.push_ref(device_array._buffer_view)
+
+    vm_context.invoke(entry_function, arg_list, ret_list)
+
+    for i, ret in enumerate(outputs):
+        device_buffer_view = rt.HalBufferView.__iree_vm_cast__(ret_list.get_as_ref(i))
+        device_array = rt.DeviceArray(device, device_buffer_view)
+
+        # TODO: Make to_host accept out array/buffer, so we can avoid extra data copy.
+        host_array = device_array.to_host()
+
+        # Convert to torch tensor without actually importing torch.
+        ret[:] = type(ret)(host_array)
 
 
 class LaunchableWave(Launchable):
@@ -173,11 +199,14 @@ class LaunchableWave(Launchable):
         idxc.finalize()
 
         # Promote the placeholders to the appropriate address space.
-        promote_placeholders(graph)
+        promote_placeholders(graph, self.constraints)
         hoist_allocs(graph)
 
         # Expansion
         expand_graph(graph, self.constraints)
+
+        # Register analysis to determine register shapes.
+        determine_register_shape(graph)
 
         self.grid_type.dims = [1, 1, 1]
         for constraint in self.workgroup_constraints:
@@ -197,15 +226,81 @@ class LaunchableWave(Launchable):
         exe = dispatch_codegen.StreamExecutable(mb, name=entrypoint_name)
         dispatch_entrypoint = exe.define_entrypoint(entrypoint_name, kernel_sig, grid)
 
-        emitter = WaveEmitter(dispatch_entrypoint, graph)
+        emitter = WaveEmitter(dispatch_entrypoint, graph, self.constraints)
         emitter.emit(graph.get_root_graph())
         emitter.finish()
 
-        return mb, graph
+        if kwargs.get("canonicalize", False):
+            canonicalize_module(mb.module_op)
+
+        return mb, graph, exe, kernel_sig, entrypoint_name
 
     def test_execute(self, args, kwargs):
-        # For now only tracing
-        mb, graph = self._trace_and_get_kernel_signature(args, kwargs)
+        (
+            mb,
+            graph,
+            exe,
+            kernel_sig,
+            entrypoint_name,
+        ) = self._trace_and_get_kernel_signature(args, kwargs)
+
+        if kwargs.get("run", False):
+            # TODO: cache compiled code
+            host_codegen.isolated_test_call(mb, exe, kernel_sig, entrypoint_name)
+            asm = mb.module_op.get_asm()
+
+            kernel_inputs = []
+            kernel_outputs = []
+            for arg, b in zip(args, kernel_sig.kernel_buffer_bindings):
+                usage = b.kernel_buffer_type.usage
+                if usage == kernel_codegen.KernelBufferUsage.INPUT:
+                    kernel_inputs.append(arg)
+
+                if usage == kernel_codegen.KernelBufferUsage.OUTPUT:
+                    kernel_outputs.append(arg)
+
+            # TODO: Have some default config.
+            config = kwargs.get("run_config", None)
+            if not config:
+                raise ValueError("no config provided")
+
+            backend = config["backend"]
+            device = config["device"]
+            flags = [
+                f"--iree-hal-target-backends={backend}",
+                "--iree-vm-bytecode-module-strip-source-map=true",
+                "--iree-opt-strip-assertions=true",
+                "--iree-vm-target-truncate-unsupported-floats",
+            ]
+
+            # TODO: More targets/backends support.
+            if backend == "rocm":
+                target = config["target"]
+                flags.append(f"--iree-rocm-target-chip={target}")
+
+            if config.get("print_ir_after_all", False):
+                flags.append("--mlir-print-ir-after-all")
+
+            res = compile_str(asm, target_backends=[backend], extra_args=flags)
+
+            rt_config = rt.Config(device)
+            device = rt_config.device
+            vm_instance = rt_config.vm_instance
+            mod = rt.VmModule.copy_buffer(vm_instance, res)
+
+            vm_modules = [
+                mod,
+                rt.create_hal_module(vm_instance, device),
+            ]
+            ctx = rt.SystemContext(
+                vm_modules=vm_modules,
+                config=rt_config,
+            )
+            vm_context = ctx.vm_context
+
+            func = mod.lookup_function("isolated_benchmark")
+            _invoke(vm_context, device, func, kernel_inputs, kernel_outputs)
+
         return mb
 
     def aot_execute(self, args, kwargs):

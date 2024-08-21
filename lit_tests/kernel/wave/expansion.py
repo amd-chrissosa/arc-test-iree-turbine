@@ -1,39 +1,14 @@
 # RUN: python %s | FileCheck %s
 
 import logging
-from typing import Callable
 import unittest
 import shark_turbine.kernel as tk
 import shark_turbine.kernel.lang as tkl
 import shark_turbine.kernel.wave as tkw
 from shark_turbine.kernel.wave.expansion import expand_graph
-from shark_turbine.kernel._support.tracing import CapturedTrace
 from shark_turbine.kernel._support.indexing import IndexingContext
-from shark_turbine.kernel.ops.wave_ops import get_custom
 from shark_turbine.kernel.lang.global_symbols import *
-
-
-def run(func: Callable[[], None]) -> Callable[[], None]:
-    """Run a function as part of the test suite."""
-    if __name__ == "__main__":
-        func()
-        # Print a separator between tests
-        print("-----")
-    return func
-
-
-def print_trace(trace: CapturedTrace):
-    """
-    Prints all subgraphs of a trace starting with the root graph.
-    The graphs are printed first in the torch printing format and
-    then using our custom node format.
-    """
-    # The root graph is at the back so we print the subgraphs in reverse order
-    for subgraph in reversed(list(trace.region_graph.subgraphs.values())):
-        print(subgraph)
-        for node in subgraph.nodes:
-            print(get_custom(node))
-
+from shark_turbine.kernel.wave.utils import run_test, print_trace
 
 # Input sizes
 M = tkl.sym.M
@@ -61,7 +36,7 @@ def read_write_same_size(
     tkw.write(a_reg, c, elements_per_thread=4)
 
 
-@run
+@run_test
 def test_read_write_equal_sizes():
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
@@ -88,13 +63,13 @@ def test_read_write_equal_sizes():
         # CHECK: %a
         # CHECK-NEXT: %c
         # CHECK-NEXT: %read_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_1_1
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_1_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_0_1
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %write_0_0
         # CHECK-SAME: (%read_0_0, %c, 4, None)
         # CHECK-NEXT: %write_1_1
@@ -138,7 +113,7 @@ def read_write_different_dims(
     tkw.write(a_reg, c, elements_per_thread=4)
 
 
-@run
+@run_test
 def test_read_write():
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
@@ -166,9 +141,9 @@ def test_read_write():
         # CHECK: %a
         # CHECK-NEXT: %c
         # CHECK-NEXT: %read_0_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_1_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %write_0_0_0
         # CHECK-SAME: (%read_0_0_0, %c, 4, None)
         # CHECK-NEXT: %write_1_0_1
@@ -217,7 +192,7 @@ def gemm(
     tkw.write(repeat, c, elements_per_thread=4)
 
 
-@run
+@run_test
 def test_gemm():
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
@@ -294,23 +269,23 @@ def test_gemm():
 
         # CHECK-NEXT: %a
         # CHECK-NEXT: %read_0_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_0_0_1
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_1_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_1_0_1
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
 
         # CHECK-NEXT: %b
         # CHECK-NEXT: %read_0_0_0
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_0_1
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_1_0
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_1_1
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
 
         # CHECK-NEXT: %mma_0_0_0
         # CHECK-SAME: (%read_0_0_0, %read_0_0_0, %acc_0_0_0)
@@ -350,31 +325,31 @@ def test_gemm():
         # CHECK-SAME: acc=acc_0_0_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_0_0_1 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
         # CHECK-SAME: rhs=read_0_0_1 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_0_0 (index = None))
+        # CHECK-SAME: acc=mma_0_0_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_1_0_0 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_0 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: acc=acc_1_1_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) + 16 : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: mma(lhs=read_1_0_1 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_1 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
-        # CHECK-SAME: acc=mma_1_1_0 (index = None))
+        # CHECK-SAME: acc=mma_1_1_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) + 16 : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: mma(lhs=read_1_0_0 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: rhs=read_0_0_0 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: acc=acc_1_0_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) + 16 : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_1_0_1 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
         # CHECK-SAME: rhs=read_0_0_1 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
-        # CHECK-SAME: acc=mma_1_0_0 (index = None))
+        # CHECK-SAME: acc=mma_1_0_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) + 16 : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_0_0_0 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_0 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: acc=acc_0_1_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: mma(lhs=read_0_0_1 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_1 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_1_0 (index = None))
+        # CHECK-SAME: acc=mma_0_1_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: output(return_vals=([mma_0_0_1, mma_1_1_1, mma_1_0_1, mma_0_1_1],))
 
         # CHECK-NEXT: -----
 
 
-@run
+@run_test
 def test_gemm_reduction_expansion_only():
     # Note: This does not implement an actual gemm computation but reuses the
     # gemm kernel to test the expansion of the reduction subgraph.
@@ -434,31 +409,31 @@ def test_gemm_reduction_expansion_only():
 
         # CHECK-NEXT: %a
         # CHECK-NEXT: %read_0_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_0_0_1
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_0_0_2
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_0_0_3
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
 
         # CHECK-NEXT: %b
         # CHECK-NEXT: %read_0_0_0
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_0_1
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_0_2
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_0_3
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_1_0
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_1_1
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_1_2
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
         # CHECK-NEXT: %read_0_1_3
-        # CHECK-SAME: (%b, 4, None)
+        # CHECK-SAME: (%b, 4, None, None)
 
         # CHECK-NEXT: %mma_0_0_0
         # CHECK-SAME: (%read_0_0_0, %read_0_0_0, %acc_0_0_0)
@@ -502,25 +477,25 @@ def test_gemm_reduction_expansion_only():
         # CHECK-SAME: acc=acc_0_0_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_0_0_1 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
         # CHECK-SAME: rhs=read_0_0_1 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_0_0 (index = None))
+        # CHECK-SAME: acc=mma_0_0_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_0_0_2 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 32 : 4 : 1])
         # CHECK-SAME: rhs=read_0_0_2 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 32 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_0_1 (index = None))
+        # CHECK-SAME: acc=mma_0_0_1 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_0_0_3 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 48 : 4 : 1])
         # CHECK-SAME: rhs=read_0_0_3 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 48 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_0_2 (index = None))
+        # CHECK-SAME: acc=mma_0_0_2 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16)]))
         # CHECK-NEXT: mma(lhs=read_0_0_0 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_0 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) : 4 : 1])
         # CHECK-SAME: acc=acc_0_1_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: mma(lhs=read_0_0_1 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_1 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 16 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_1_0 (index = None))
+        # CHECK-SAME: acc=mma_0_1_0 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: mma(lhs=read_0_0_2 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 32 : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_2 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 32 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_1_1 (index = None))
+        # CHECK-SAME: acc=mma_0_1_1 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: mma(lhs=read_0_0_3 (index = [$T0*BLOCK_M/128 + $WG0*BLOCK_M + Mod($T0, 16), 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 48 : 4 : 1])
         # CHECK-SAME: rhs=read_0_1_3 (index = [$T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16, 16*$T1 + 16*$T2 + ARGK*BLOCK_K + 4*floor($T0/16) + 48 : 4 : 1])
-        # CHECK-SAME: acc=mma_0_1_2 (index = None))
+        # CHECK-SAME: acc=mma_0_1_2 (index = [$T0*BLOCK_M/128 + 16*$T1 + 16*$T2 + $WG0*BLOCK_M + 4*floor($T0/16) : 4 : 16, $T1*BLOCK_N/2 + $WG1*BLOCK_N + Mod($T0, 16) + 16]))
         # CHECK-NEXT: output(return_vals=([mma_0_0_3, mma_0_1_3],))
 
         # CHECK-NEXT: -----
@@ -537,7 +512,7 @@ def py_arithmetic_different_dims(
     tkw.write(a_reg, c, elements_per_thread=4)
 
 
-@run
+@run_test
 def py_arithmetic_different_dims():
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
@@ -565,9 +540,9 @@ def py_arithmetic_different_dims():
         # CHECK: %a
         # CHECK-NEXT: %c
         # CHECK-NEXT: %read_0_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %read_1_0_0
-        # CHECK-SAME: (%a, 4, None)
+        # CHECK-SAME: (%a, 4, None, None)
         # CHECK-NEXT: %add_0_0_0
         # CHECK-SAME: (%read_0_0_0, %read_0_0_0)
         # CHECK-NEXT: %add_1_0_0

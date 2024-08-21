@@ -17,8 +17,7 @@ from typing import (
 )
 import torch.fx as fx
 
-if TYPE_CHECKING:
-    from ..lang.wave_types import Memory, Register
+from ..lang.wave_types import Memory, Register, IndexMapping
 from .._support.indexing import IndexExpr, IndexSymbol, IndexSequence
 from .._support.dtype import DataType
 from .._support.regions import RegionGraph
@@ -38,6 +37,10 @@ PlaceholderT = TypeVar("PlaceholderT", bound="Placeholder")
 def allocate(
     shape: tuple[IndexExpr], dtype: DataType, address_space: IndexSymbol
 ) -> "Memory":
+    ...
+
+
+def shared_memory_barrier():
     ...
 
 
@@ -273,6 +276,7 @@ class CustomOp(ABC):
             graph.inserting_after(self.fx_node)
         new_node = graph.node_copy(self.fx_node)
         new_node.tkw_op = self
+        new_node.tkw_op_name = self.tkw_op_name
         new_node.index = copy.deepcopy(self.fx_node.index)
         if new_name:
             new_node.name = new_name
@@ -339,7 +343,7 @@ class CustomOp(ABC):
                 assert isinstance(
                     key, IndexSequence
                 ), f"Expected IndexSequence, got {key}"
-                if not hasattr(self.fx_node, "index"):
+                if not hasattr(self.fx_node, "index") or self.fx_node.index is None:
                     self.fx_node.index = {}
                 self.fx_node.index[dim] = key
         else:
@@ -442,6 +446,7 @@ class Output(CustomOp):
             kwargs={},
         )
         self.fx_node.tkw_op = self.__class__
+        self.fx_node.tkw_op_name = self.tkw_op_name
         return self.fx_node
 
 
@@ -466,6 +471,7 @@ class Placeholder(CustomOp):
         self.graph = region_graph
         self.fx_node = region_graph.create_node("placeholder", target=self._name)
         self.fx_node.tkw_op = self.__class__
+        self.fx_node.tkw_op_name = self.tkw_op_name
         return self.fx_node
 
     def custom_string(self, value_map: dict[str, str]) -> str:
@@ -502,12 +508,39 @@ class Allocate(CustomOp):
     """
 
     shape: tuple[IndexExpr]
+    distributed_shape: tuple[IndexExpr]
     dtype: DataType
     address_space: AddressSpace
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
         return list(self.shape)
+
+    @property
+    def type(self) -> "Memory":
+        return Memory[*self.shape, self.address_space, self.dtype]
+
+
+@define_op("barrier")
+@dataclass
+class SharedMemoryBarrier(CustomOp):
+    """
+    Represents a shared memory barrier in the graph.
+    """
+
+    def is_barrier_between(self, src: fx.Node, dst: fx.Node) -> bool:
+        """
+        Checks if there is a barrier between the source and destination nodes.
+        """
+        prev_node, next_node = self.fx_node.prev, self.fx_node.next
+        found_src, found_dst = prev_node == src, next_node == dst
+        while prev_node.prev.op != "root" and not found_src:
+            prev_node, found_src = prev_node.prev, prev_node == src
+        if not found_src:
+            return False
+        while next_node and not found_dst:
+            next_node, found_dst = next_node.next, next_node == dst
+        return found_dst
 
 
 @define_op("register")
@@ -520,6 +553,10 @@ class NewRegister(CustomOp):
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
         return list(self.shape)
+
+    @property
+    def type(self) -> "Register":
+        return Register[*self.shape, self.dtype]
 
 
 @define_op("mma")
@@ -551,6 +588,10 @@ class MMA(CustomOp):
     def acc_type(self) -> Memory:
         return get_custom(self.acc).type
 
+    @property
+    def type(self) -> Memory:
+        return self.acc_type
+
     def operand_index(
         self, operand_map: dict[IndexSymbol, int], shape: list[IndexExpr]
     ) -> list[IndexSequence]:
@@ -572,7 +613,7 @@ class MMA(CustomOp):
     @property
     def acc_index(self) -> list[IndexSequence]:
         operand_map = {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1}
-        if self.acc.type is None:
+        if self.acc_type is None:
             return None
         return self.operand_index(operand_map, self.acc_type.symbolic_shape)
 
@@ -592,17 +633,26 @@ class Read(CustomOp):
     memory: fx.Proxy
     elements_per_thread: Optional[Any] = None
     mapping: Optional[IndexMapping] = None
+    _write_dependency: Optional[fx.Node] = None
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
         if self.mapping is not None:
             return list(self.mapping.output_shape)
         # TODO: This could contain ints.
-        return list(self.memory.type.symbolic_shape)
+        return list(self.type.symbolic_shape)
 
     @property
     def type(self) -> "Memory":
-        return self.memory.type
+        return get_custom(self.memory).type
+
+    @property
+    def write_dependency(self) -> fx.Node:
+        return self._write_dependency
+
+    @write_dependency.setter
+    def write_dependency(self, value: fx.Node):
+        self.update_arg(len(self.fx_node.args) - 1, value)
 
 
 @define_op("reduction")
@@ -636,6 +686,7 @@ class Reduction(CustomOp):
 
             node._add_proxy_to_graph(graph)
             node.fx_node.node.tkw_op = cls
+            node.fx_node.node.tkw_op_name = cls.tkw_op_name
             return node.fx_node
 
         return wrapper
@@ -649,6 +700,41 @@ class Reduction(CustomOp):
                     expand_dims.append(indexing_dim)
         return expand_dims
 
+    def iter_args(self, graph: fx.Graph) -> list[fx.Node]:
+        """
+        The first N placeholders in the subgraph are the iter args, where
+        the total number of placeholders in the subgraph is N + M, where M
+        is the number of implicit captures.
+        """
+        iter_args = []
+        for nested_node in graph.nodes:
+            custom = get_custom(nested_node)
+            if isinstance(custom, Placeholder):
+                iter_args.append(nested_node)
+        return iter_args[: -len(self.implicit_captures)]
+
+    def captured_vars(self, graph: fx.Graph) -> list[fx.Node]:
+        """
+        The last M placeholders in the subgraph are the captured vars, where
+        the total number of placeholders in the subgraph is N + M, where N
+        is the number of iter args.
+        """
+        captured_vars = []
+        for nested_node in graph.nodes:
+            custom = get_custom(nested_node)
+            if isinstance(custom, Placeholder):
+                captured_vars.append(nested_node)
+        return captured_vars[-len(self.implicit_captures) :]
+
+    @property
+    def type(self) -> list[Memory | Register]:
+        return [get_custom(x).type for x in self.init_args]
+
+    def outputs(self, graph: fx.Graph) -> list[fx.Node]:
+        for node in graph.nodes:
+            if isinstance(get_custom(node), Output):
+                return node.args[0]
+
 
 @define_op("write")
 @dataclass
@@ -660,12 +746,14 @@ class Write(CustomOp):
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
+        if self.mapping is not None:
+            return list(self.mapping.input_shape)
         # TODO: This could contain ints.
-        return list(self.memory.type.symbolic_shape)
+        return list(self.type.symbolic_shape)
 
     @property
     def type(self) -> "Memory":
-        return self.memory.type
+        return get_custom(self.memory).type
 
 
 @define_op("get_result")
@@ -676,7 +764,7 @@ class GetResult(CustomOp):
 
     @property
     def type(self) -> "Memory":
-        return self.value.type
+        return get_custom(self.value).type[self.res_idx]
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
