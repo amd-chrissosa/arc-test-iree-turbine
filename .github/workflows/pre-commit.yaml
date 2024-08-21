@@ -7,7 +7,7 @@ on:
 
 jobs:
   pre-commit:
-    runs-on: sosa-arc-test-runners
+    runs-on: arc-test-runners
     steps:
     - uses: actions/checkout@v3
     - uses: actions/setup-python@v3
