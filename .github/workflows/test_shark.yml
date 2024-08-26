@@ -21,14 +21,14 @@ jobs:
       matrix:
         version: [3.11]
 
-    container: ghcr.io/nod-ai/manylinux_ghr_x86_64:main
+    container: gcr.io/iree-oss/base@sha256:dc314b4fe30fc1315742512891357bffed4d1b62ffcb46258b1e0761c737b446
     runs-on:
       - arc-test-runners
     steps:
-    #  - name: "Setting up Python"
-    #    uses: actions/setup-python@75f3110429a8c05be0e1bf360334e4cced2b63fa # v2.3.3
-    #    with:
-    #      python-version: ${{matrix.version}}
+      - name: "Setting up Python"
+        uses: actions/setup-python@75f3110429a8c05be0e1bf360334e4cced2b63fa # v2.3.3
+        with:
+          python-version: ${{matrix.version}}
 
       - name: "Checkout SHARK"
         uses: actions/checkout@v4
