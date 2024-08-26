@@ -75,6 +75,10 @@ def write(
     ...
 
 
+def exp2(src: "Register") -> "Register":
+    ...
+
+
 def define_op(op_name: str) -> Callable[[T], T]:
     def decorator(cls: T) -> T:
         cls.tkw_op_name = op_name
@@ -167,6 +171,12 @@ def get_custom(node: fx.Node) -> "CustomOp":
     if node.op == "output":
         return Output.from_fx_node(node)
     return Unknown.from_fx_node(node)
+
+
+def has_same_custom_type(lhs_type: Memory, rhs_type: Memory) -> bool:
+    same_shape = lhs_type.symbolic_shape == rhs_type.symbolic_shape
+    same_dtype = lhs_type.dtype == rhs_type.dtype
+    return same_shape and same_dtype
 
 
 @dataclass
@@ -285,7 +295,7 @@ class CustomOp(ABC):
     def replace_all_uses_with(self, new_node: CustomOp | fx.Node):
         """Replace all uses of the current node with the new node."""
         for user in self.users:
-            user.update_arg(user.node_args.index(self), new_node)
+            user.update_arg(user.get_node_arg_index(self), new_node)
 
     def erase(self):
         """Erase the current node from the graph where it exists."""
@@ -309,12 +319,18 @@ class CustomOp(ABC):
         return self.fx_node.name
 
     @property
-    def node_args(self) -> list[Any]:
+    def node_args(self) -> dict[int, Any]:
         """Returns the args to this custom op using subclasses of CustomOp if possible."""
-        return [
-            get_custom(arg) if isinstance(arg, fx.Node) else arg
-            for arg in self.fx_node.args
-        ]
+        custom_args = {}
+        for i, arg in enumerate(self.fx_node.args):
+            if isinstance(arg, fx.Node):
+                custom_args[i] = get_custom(arg)
+            if isinstance(arg, list) and all(isinstance(x, fx.Node) for x in arg):
+                custom_args[i] = [get_custom(x) for x in arg]
+        return custom_args
+
+    def get_node_arg_index(self, arg: CustomOp) -> Optional[CustomOp | list[CustomOp]]:
+        return next(key for key, value in self.node_args.items() if value == arg)
 
     @property
     def users(self) -> list[Any]:
@@ -353,6 +369,8 @@ class CustomOp(ABC):
 @define_py_op(operator.getitem)
 @define_py_op(operator.add)
 @define_py_op(operator.sub)
+@define_py_op(operator.mul)
+@define_py_op(operator.truediv)
 @dataclass
 class BinaryPyOp(CustomOp, ABC):
     """
@@ -377,7 +395,17 @@ class BinaryPyOp(CustomOp, ABC):
     def py_operator(self) -> str:
         return self.tkw_op_name
 
+    @property
+    def type(self) -> Memory:
+        lhs_type = get_custom(self.lhs).type
+        rhs_type = get_custom(self.rhs).type
+        has_same_type = has_same_custom_type(lhs_type, rhs_type)
+        if not has_same_type:
+            raise ValueError("Expected lhs and rhs to have same type post-expansion")
+        return lhs_type
 
+
+@define_op("exp2")
 @define_py_op(operator.neg)
 @dataclass
 class UnaryPyOp(CustomOp, ABC):
@@ -394,6 +422,11 @@ class UnaryPyOp(CustomOp, ABC):
     @property
     def py_operator(self) -> str:
         return self.tkw_op_name
+
+    @property
+    def type(self) -> Memory:
+        src_type = get_custom(self.arg).type
+        return src_type
 
 
 @final
@@ -633,7 +666,7 @@ class Read(CustomOp):
     memory: fx.Proxy
     elements_per_thread: Optional[Any] = None
     mapping: Optional[IndexMapping] = None
-    _write_dependency: Optional[fx.Node] = None
+    _write_dependency: Optional[list[fx.Node]] = None
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
