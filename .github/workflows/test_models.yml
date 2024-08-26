@@ -7,6 +7,14 @@ on:
     branches:
       - main
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  ACTIONS_RUNNER_DEBUG: true
+  ACTIONS_STEP_DEBUG: true
+
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
   # queued and in-progress runs for the same PR (presubmit) or commit
@@ -17,7 +25,7 @@ concurrency:
 
 jobs:
   test-turbine-models-cpu:
-    container: ghcr.io/nod-ai/manylinux_ghr_x86_64:main
+    container: ghcr.io/iree-org/cpubuilder_ubuntu_jammy_ghr_x86_64:main
     runs-on:
       - arc-test-runners
     steps:
